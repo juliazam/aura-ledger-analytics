@@ -78,3 +78,16 @@ Inside your defined vault_dir, processed transactions are automatically partitio
 │       └── day=13/
 │           └── part-0.parquet   # High-performance column-oriented dataset
 ```
+
+## ⏱️ Deadline Monitoring
+
+The pipeline uses Airflow's `DeadlineAlert` (replacement for the deprecated SLA feature in Airflow 3.0+) 
+to detect abnormally slow DAG runs.
+
+**Current threshold:** 15 minutes from `DAGRUN_LOGICAL_DATE`.
+
+This value is intentionally conservative — real measured run duration is ~27 seconds under normal 
+conditions (verified via manual trigger). The 15-minute threshold is not tuned to typical performance; 
+it's set as a generous upper bound to catch true pipeline stalls (e.g. hung API calls, DB locks) rather 
+than to flag routine variance. As more production run history accumulates, this should be tightened 
+(e.g. to 2–3 minutes) based on observed p95/p99 run durations.

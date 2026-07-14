@@ -15,7 +15,7 @@ Date: July 2026
 import os
 from datetime import datetime, timezone, timedelta
 import pandas as pd
-from airflow.sdk import dag, task, get_current_context
+from airflow.sdk import dag, task, get_current_context, DeadlineAlert, DeadlineReference, SyncCallback
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.http.hooks.http import HttpHook
@@ -64,11 +64,19 @@ def report_task_failure(context):
         severity="ERROR",
     )
 
+def notify_deadline_miss(context):
+    print(f"⏰ DEADLINE MISSED for DAG run: {context}")
+
 @dag(
     dag_id="aura_multi_source_fintech_etl",
     start_date=datetime(2026, 7, 1),
     schedule="@hourly",
     catchup=False,
+    deadline=DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_LOGICAL_DATE,
+        interval=timedelta(minutes=15),
+        callback=SyncCallback(notify_deadline_miss),
+    ),
     default_args={
         "on_failure_callback": report_task_failure,
         "retries": 1,
@@ -99,7 +107,7 @@ def multi_source_fintech_etl():
     # 2. Local File System Preparation
     prepare_storage = BashOperator(
         task_id="create_vault_directory",
-        bash_command="mkdir -p {{ var.json.aura_etl_config.vault_dir }}"
+        bash_command="mkdir -p {{ var.json.aura_etl_config.vault_dir }}",
     )
 
     # 3. Exchange Rate Extraction
