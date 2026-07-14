@@ -1,0 +1,6 @@
+apache-airflow==3.3.0
+psycopg2-binary==2.9.12
+apache-airflow-providers-http==6.0.4
+apache-airflow-providers-postgres==6.8.0
+pandas==3.0.3
+pyarrow==25.0.0

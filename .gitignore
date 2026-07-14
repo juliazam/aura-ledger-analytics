@@ -1,0 +1,18 @@
+# Configuration
+.env
+
+# Virtial environment and Python cache
+.venv/
+__pycache__/
+*.pyc
+
+# Docker/Airflow runtime artifacts
+airflow_home/
+airflow/
+logs/
+data/
+include/
+*.log
+*.pid
+config/*.cfg
+!config/.gitkeep
