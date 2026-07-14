@@ -13,14 +13,36 @@ Author: juliazam / Aura Blockchain Team
 Date: July 2026
 """
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
-from airflow.sdk import dag, task
+from airflow.sdk import dag, task, get_current_context
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.http.sensors.http import HttpSensor
 from airflow.models import Variable
+
+def send_alert(dag_id: str, task_id: str, run_id: str, message: str, severity: str = "ERROR") -> None:
+    """
+    A single point for sending alerts—for both full task failures and soft warnings
+    (e.g., detected anomalies)—that don't interrupt pipeline execution.
+
+    In production, this will involve a real call to an external channel
+    (Telegram/Slack/PagerDuty) via HttpHook and Connection.
+    """
+    icon = "❌" if severity == "ERROR" else "⚠️"
+    alert_message = f'''
+    {icon} [AIRFLOW ALERT — {severity}]
+    --------------------------------------
+    DAG: {dag_id}
+    Task: {task_id}
+    Run ID: {run_id}
+    Message: {message}
+    Time: {datetime.now(timezone.utc).isoformat()}
+    --------------------------------------
+    '''
+    print(alert_message)
+    # Reserved for integration: HttpHook(http_conn_id='telegram_mesh').run(...)
 
 def report_task_failure(context):
     """
@@ -33,23 +55,14 @@ def report_task_failure(context):
     Args:
         context (dict): The Airflow context dictionary containing metadata about the failed task.
     """
-    dag_id = context.get("task_instance").dag_id
-    task_id = context.get("task_instance").task_id
-    run_id = context.get("task_instance").run_id
-    exception = context.get("exception")
-
-    alert_message = f'''
-    ❌ [AIRFLOW ALERT] Task Failed!
-    --------------------------------------
-    DAG: {dag_id}
-    Task: {task_id}
-    Run ID: {run_id}
-    Error: {exception}
-    Time: {datetime.now(timezone.utc).isoformat()}
-    --------------------------------------
-    '''
-    print(alert_message)
-    # Reserved for integration: HttpHook(http_conn_id='telegram_mesh').run(...)
+    ti = context.get("task_instance")
+    send_alert(
+        dag_id=ti.dag_id,
+        task_id=ti.task_id,
+        run_id=ti.run_id,
+        message=str(context.get("exception")),
+        severity="ERROR",
+    )
 
 @dag(
     dag_id="aura_multi_source_fintech_etl",
@@ -59,7 +72,7 @@ def report_task_failure(context):
     default_args={
         "on_failure_callback": report_task_failure,
         "retries": 1,
-        "retry_delay": 30,
+        "retry_delay": timedelta(seconds=30),
     }
 )
 def multi_source_fintech_etl():
@@ -69,18 +82,6 @@ def multi_source_fintech_etl():
     Fetches raw OLTP records and exchange rate updates concurrently, executes
     enrichment and risk evaluations, and dumps the output into a localized Parquet Data Lake.
     """
-
-    # Fetch configuration schema from Airflow Variables.
-    # Uses fallback dictionary for local development to support Zero-Setup Deployments.
-    conf = Variable.get(
-        "aura_etl_config", 
-        deserialize_json=True,
-        default_var={
-            "vault_dir": "/opt/airflow/data/aura_blockchain_vault",
-            "target_currencies": ["USD", "EUR", "SGD", "NZD"],
-            "anomaly_threshold_sgd": 10000.0
-        }
-    )
 
     # 1. External API Availability Check
     # Ensures the pipeline fails fast if the external exchange rate service is unreachable.
@@ -98,7 +99,7 @@ def multi_source_fintech_etl():
     # 2. Local File System Preparation
     prepare_storage = BashOperator(
         task_id="create_vault_directory",
-        bash_command=f"mkdir -p {conf['vault_dir']}"
+        bash_command="mkdir -p {{ var.json.aura_etl_config.vault_dir }}"
     )
 
     # 3. Exchange Rate Extraction
@@ -110,8 +111,16 @@ def multi_source_fintech_etl():
         Saves computational overhead by immediately filtering out non-target currencies 
         before sending the payload to the Airflow metadata database (XCom).
         """
-        task_conf = Variable.get("aura_etl_config", deserialize_json=True, default_var=conf)
-        target_curs = task_conf.get("target_currencies")
+        conf = Variable.get(
+            "aura_etl_config", 
+            deserialize_json=True,
+            default_var={
+                "vault_dir": "/opt/airflow/data/aura_blockchain_vault",
+                "target_currencies": ["USD", "EUR", "SGD", "NZD"],
+                "anomaly_threshold_sgd": 10000.0
+            }
+        )
+        target_curs = conf.get("target_currencies")
 
         print("Downloading currency rates from MAS API...")
         hook = HttpHook(http_conn_id="fintech_api_rates", method="GET")
@@ -184,10 +193,18 @@ def multi_source_fintech_etl():
             print("No transactions found to process.")
             return "No data"
 
-        task_conf = Variable.get("aura_etl_config", deserialize_json=True, default_var=conf)
-        target_curs = task_conf.get("target_currencies")
-        anomaly_limit = task_conf.get("anomaly_threshold_sgd")
-        vault_dir = task_conf.get("vault_dir")
+        conf = Variable.get(
+            "aura_etl_config", 
+            deserialize_json=True,
+            default_var={
+                "vault_dir": "/opt/airflow/data/aura_blockchain_vault",
+                "target_currencies": ["USD", "EUR", "SGD", "NZD"],
+                "anomaly_threshold_sgd": 10000.0
+            }
+        )
+        target_curs = conf.get("target_currencies")
+        anomaly_limit = conf.get("anomaly_threshold_sgd")
+        vault_dir = conf.get("vault_dir")
 
         # Create base DataFrame
         columns = ["transaction_id", "account_id", "amount", "currency", "status", "created_at"]
@@ -215,8 +232,37 @@ def multi_source_fintech_etl():
 
         # Audit and anomaly checks
         df_tx["is_anomaly"] = df_tx["amount_in_sgd"] > anomaly_limit
-        if df_tx["is_anomaly"].any():
-            raise ValueError("ALERT: Fraud/Anomaly detected! Pipeline stopped for audit.")
+        df_clean = df_tx[~df_tx["is_anomaly"]].copy()
+        df_flagged = df_tx[df_tx["is_anomaly"]].copy()
+        if not df_flagged.empty:
+            context = get_current_context()
+            ti = context["task_instance"]
+            send_alert(
+                dag_id=ti.dag_id,
+                task_id=ti.task_id,
+                run_id=ti.run_id,
+                message=f"{len(df_flagged)} transaction(s) exceeded {anomaly_limit} SGD threshold: "
+                        f"{df_flagged['transaction_id'].tolist()}",
+                severity="WARNING",
+            )
+
+            quarantine_dir = f"{vault_dir}_quarantine"
+            df_flagged["created_at"] = pd.to_datetime(df_flagged["created_at"])
+            df_flagged["year"] = df_flagged["created_at"].dt.year
+            df_flagged["month"] = df_flagged["created_at"].dt.strftime("%m")
+            df_flagged["day"] = df_flagged["created_at"].dt.strftime("%d")
+            df_flagged.to_parquet(
+                quarantine_dir,
+                partition_cols=["year", "month", "day"],
+                index=False,
+                engine="pyarrow",
+            )
+            print(f"Flagged transactions written to quarantine: {quarantine_dir}")
+
+        df_tx = df_clean
+        if df_tx.empty:
+            print("No clean transactions remained after anomaly filtering.")
+            return "No clean data"
 
         # Extract partition keys from temporal metadata
         df_tx["created_at"] = pd.to_datetime(df_tx["created_at"])
